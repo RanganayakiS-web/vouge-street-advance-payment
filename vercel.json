@@ -1,8 +1,8 @@
 {
   "functions": {
-    "api/create-order.js": {
-      "memory": 128,
-      "maxDuration": 10
-    }
+    "api/create-razorpay-order.js": { "memory": 128, "maxDuration": 10 },
+    "api/verify-and-create-order.js": { "memory": 256, "maxDuration": 15 },
+    "api/razorpay-webhook.js": { "memory": 128, "maxDuration": 10 },
+    "api/create-order.js": { "memory": 128, "maxDuration": 10 }
   }
 }
