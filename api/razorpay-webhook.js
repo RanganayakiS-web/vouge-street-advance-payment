@@ -1,22 +1,20 @@
-// Vouge Street — Razorpay Webhook Handler (SERVER-SIDE ORDER CREATION / SAFETY NET)
+// Vouge Street — Razorpay Webhook Handler (SINGLE SOURCE OF TRUTH for order creation)
 //
-// Fires server-to-server on payment.captured, so the Shopify order is created even if the
-// shopper's browser dropped the step (mobile UPI app-switch). Reads the cart + customer from
-// the Razorpay ORDER notes (stashed by create-razorpay-order.js) and creates the order via the
-// shared idempotent helper (de-dupes on payment_id, so it never duplicates the browser path).
+// The Shopify order is created here and ONLY here, on the `payment.captured` event. The browser
+// (verify-and-create-order.js) no longer creates orders, so there is exactly one creator per
+// payment — no duplicate orders. `order.paid` is intentionally ignored for creation (it would
+// fire a second time for the same payment).
 //
-// NOTE: On plain Vercel @vercel/node functions the JSON body is ALREADY parsed into req.body
-// (the Next.js-only `bodyParser:false` config export is ignored here). So we use req.body and
-// verify the Razorpay signature best-effort — we never drop a real order on a signature miss,
-// because creation is idempotent and requires a genuine Razorpay order carrying our notes.
+// Reads the cart + customer from the Razorpay ORDER notes (stashed by create-razorpay-order.js)
+// and creates the order via the shared helper (which also applies the discount and de-dupes on
+// the rzp-<payment_id> tag as a best-effort backstop against a rare double delivery).
 //
-// Razorpay Dashboard → Settings → Webhooks:
-//   URL:    https://vouge-street-advance-payment.vercel.app/api/razorpay-webhook
-//   Events: payment.captured, order.paid, payment.failed
-//   Secret: must equal process.env.RAZORPAY_WEBHOOK_SECRET
+// Razorpay Dashboard → Webhooks:  URL .../api/razorpay-webhook
+//   Events: payment.captured (required), payment.failed. order.paid may be left on — it's ignored.
+//   Secret must equal process.env.RAZORPAY_WEBHOOK_SECRET.
 
 import crypto from 'crypto';
-import { createShopifyOrder, findOrderByPayment, parseRazorpayNotes } from './_shopify-order.js';
+import { createShopifyOrder, parseRazorpayNotes } from './_shopify-order.js';
 
 function readRaw(req) {
   return new Promise((resolve) => {
@@ -51,7 +49,7 @@ export default async function handler(req, res) {
     try { body = JSON.parse(raw || '{}'); } catch { body = {}; }
   }
 
-  // Best-effort signature check (never rejects a real order — see header note).
+  // Best-effort signature check (never rejects a real order — see header of _shopify-order.js).
   const secret = process.env.RAZORPAY_WEBHOOK_SECRET;
   const signature = req.headers['x-razorpay-signature'];
   if (secret && signature) {
@@ -71,7 +69,12 @@ export default async function handler(req, res) {
   });
 
   try {
-    if (event === 'payment.captured' || event === 'order.paid') {
+    // Order.paid would double-create — ignore it. payment.captured is the sole creator.
+    if (event === 'order.paid') {
+      return res.status(200).json({ received: true, ignored: 'order.paid' });
+    }
+
+    if (event === 'payment.captured') {
       const razorpay_payment_id = payment && payment.id;
       const razorpay_order_id   = (payment && payment.order_id) || (orderEnt && orderEnt.id);
       if (!razorpay_payment_id || !razorpay_order_id) {
@@ -87,17 +90,6 @@ export default async function handler(req, res) {
         return res.status(200).json({ received: true, skipped: 'insufficient notes' });
       }
 
-      // Anti-duplicate: the browser fast-path (verify-and-create-order) usually creates the
-      // order within ~1-2s of payment. Give it a head start so the webhook only creates the
-      // order when the browser genuinely didn't (e.g. mobile UPI app-switch). If a retry or
-      // race still slips through, createShopifyOrder's own tag lookup is the final guard.
-      const existing = await findOrderByPayment(razorpay_payment_id);
-      if (existing) {
-        console.log('razorpay-webhook: order already exists (browser path)', { order_name: existing.name });
-        return res.status(200).json({ received: true, order: existing.name, duplicate: true });
-      }
-      await new Promise((r) => setTimeout(r, 3000));
-
       const result = await createShopifyOrder({ razorpay_order_id, razorpay_payment_id, cart, customer });
       console.log('VS ORDER (webhook path)', { order_name: result.order.name, duplicate: result.duplicate });
       return res.status(200).json({ received: true, order: result.order.name, duplicate: result.duplicate });
@@ -111,7 +103,6 @@ export default async function handler(req, res) {
     return res.status(200).json({ received: true });
   } catch (err) {
     console.error('razorpay-webhook exception:', err);
-    // 200 so Razorpay doesn't retry forever; error is logged for review.
     return res.status(200).json({ received: true, error: err.message });
   }
 }
