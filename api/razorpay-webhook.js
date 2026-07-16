@@ -16,7 +16,7 @@
 //   Secret: must equal process.env.RAZORPAY_WEBHOOK_SECRET
 
 import crypto from 'crypto';
-import { createShopifyOrder, parseRazorpayNotes } from './_shopify-order.js';
+import { createShopifyOrder, findOrderByPayment, parseRazorpayNotes } from './_shopify-order.js';
 
 function readRaw(req) {
   return new Promise((resolve) => {
@@ -86,6 +86,17 @@ export default async function handler(req, res) {
         console.error('razorpay-webhook: insufficient notes', { razorpay_payment_id, notes });
         return res.status(200).json({ received: true, skipped: 'insufficient notes' });
       }
+
+      // Anti-duplicate: the browser fast-path (verify-and-create-order) usually creates the
+      // order within ~1-2s of payment. Give it a head start so the webhook only creates the
+      // order when the browser genuinely didn't (e.g. mobile UPI app-switch). If a retry or
+      // race still slips through, createShopifyOrder's own tag lookup is the final guard.
+      const existing = await findOrderByPayment(razorpay_payment_id);
+      if (existing) {
+        console.log('razorpay-webhook: order already exists (browser path)', { order_name: existing.name });
+        return res.status(200).json({ received: true, order: existing.name, duplicate: true });
+      }
+      await new Promise((r) => setTimeout(r, 3000));
 
       const result = await createShopifyOrder({ razorpay_order_id, razorpay_payment_id, cart, customer });
       console.log('VS ORDER (webhook path)', { order_name: result.order.name, duplicate: result.duplicate });
