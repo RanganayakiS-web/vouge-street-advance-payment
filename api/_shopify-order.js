@@ -86,12 +86,6 @@ export async function createShopifyOrder({ razorpay_order_id, razorpay_payment_i
     order: {
       line_items:     lineItems,
       discount_codes: discountCodes,
-      customer: {
-        first_name: customer.first_name,
-        last_name:  customer.last_name,
-        email:      customer.email || '',
-        phone:      customer.phone,
-      },
       billing_address:  address,
       shipping_address: address,
       financial_status: 'partially_paid',
@@ -112,10 +106,16 @@ export async function createShopifyOrder({ razorpay_order_id, razorpay_payment_i
         { name: 'prepaid_amount',      value: '99' },
         { name: 'cod_amount',          value: String(balanceCOD) },
       ],
-      send_receipt: true,
-      send_fulfillment_receipt: true,
+      send_receipt: !!customer.email,
+      send_fulfillment_receipt: !!customer.email,
     },
   };
+
+  // Associate the order with a customer by EMAIL only. We deliberately do NOT send a
+  // customer object with a phone_number: Shopify enforces phone uniqueness across customers,
+  // so a repeat / re-used phone throws "phone_number has already been taken" and blocks the
+  // whole order. The phone still travels on the shipping/billing address for couriers.
+  if (customer.email) payload.order.email = customer.email;
 
   const r = await shopifyREST('orders.json', 'POST', payload);
   if (!r.ok) {
