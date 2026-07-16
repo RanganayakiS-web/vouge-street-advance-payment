@@ -1,11 +1,16 @@
-// Vouge Street — Verify Razorpay Payment + Create Shopify Order
-// 1. Verifies Razorpay HMAC-SHA256 signature (server-side)
-// 2. Creates Shopify order with COD tags, notes, ₹99 transaction recorded
+// Vouge Street — Verify Razorpay Payment + Create Shopify Order (browser "fast path")
+// 1. Verifies the Razorpay HMAC-SHA256 signature (server-side).
+// 2. Creates the Shopify order via the shared, idempotent, discount-aware helper.
+//
+// This runs when the shopper's browser completes payment (reliable on desktop).
+// On mobile it may not complete — razorpay-webhook.js is the server-side safety net.
+// Both call the SAME helper, and the helper de-dupes on razorpay_payment_id, so they
+// can never create two orders for one payment.
 
 import crypto from 'crypto';
+import { createShopifyOrder } from './_shopify-order.js';
 
-// Simple in-memory dedup (prevents double orders on retry within same process)
-const processedPayments = new Set();
+const processedPayments = new Set(); // per-process retry guard
 
 export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', 'https://voguestreet.in');
@@ -14,13 +19,7 @@ export default async function handler(req, res) {
   if (req.method === 'OPTIONS') return res.status(200).end();
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
 
-  const {
-    razorpay_order_id,
-    razorpay_payment_id,
-    razorpay_signature,
-    cart,
-    customer,
-  } = req.body || {};
+  const { razorpay_order_id, razorpay_payment_id, razorpay_signature, cart, customer } = req.body || {};
 
   if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
     return res.status(400).json({ error: 'Missing Razorpay payment details' });
@@ -29,128 +28,43 @@ export default async function handler(req, res) {
     return res.status(400).json({ error: 'Missing cart or customer details' });
   }
 
-  if (processedPayments.has(razorpay_payment_id)) {
-    return res.status(409).json({ error: 'Payment already processed' });
-  }
-
-  const signatureBody = `${razorpay_order_id}|${razorpay_payment_id}`;
-  const expectedSignature = crypto
+  // Signature check
+  const expected = crypto
     .createHmac('sha256', process.env.RAZORPAY_KEY_SECRET)
-    .update(signatureBody)
+    .update(`${razorpay_order_id}|${razorpay_payment_id}`)
     .digest('hex');
-
-  if (expectedSignature !== razorpay_signature) {
-    console.error('SIGNATURE MISMATCH', { expected: expectedSignature, received: razorpay_signature });
+  if (expected !== razorpay_signature) {
+    console.error('SIGNATURE MISMATCH', { expected, received: razorpay_signature });
     return res.status(400).json({ error: 'Payment verification failed — invalid signature' });
   }
 
   try {
-    const cartTotalRupees = Math.round(cart.total_price / 100);
-    const balanceCOD      = cartTotalRupees - 99;
-
-    const lineItems = cart.items.map(item => ({
-      variant_id: item.variant_id,
-      quantity:   item.quantity,
-      price:      (item.price / 100).toFixed(2),
-    }));
-
-    const shippingAddress = {
-      first_name: customer.first_name,
-      last_name:  customer.last_name,
-      phone:      customer.phone,
-      address1:   customer.address1,
-      city:       customer.city,
-      province:   customer.province || '',
-      zip:        customer.zip,
-      country:    'India',
-      country_code: 'IN',
-    };
-
-    const orderPayload = {
-      order: {
-        line_items: lineItems,
-        customer: {
-          first_name: customer.first_name,
-          last_name:  customer.last_name,
-          email:      customer.email || '',
-          phone:      customer.phone,
-        },
-        billing_address:  shippingAddress,
-        shipping_address: shippingAddress,
-        financial_status: 'partially_paid',
-        transactions: [
-          {
-            kind:          'capture',
-            status:        'success',
-            amount:        '99.00',
-            currency:      'INR',
-            gateway:       'Razorpay',
-            authorization: razorpay_payment_id,
-          },
-        ],
-        tags: 'COD, Advance Paid, Advance Amount: ₹99',
-        note: `COD Order — ₹99 advance paid via Razorpay\nPayment ID: ${razorpay_payment_id}\nBalance to collect: ₹${balanceCOD}`,
-        note_attributes: [
-          { name: 'payment_type',        value: 'cod_advance' },
-          { name: 'advance_paid',        value: '₹99' },
-          { name: 'balance_cod',         value: `₹${balanceCOD}` },
-          { name: 'order_total',         value: `₹${cartTotalRupees}` },
-          { name: 'razorpay_payment_id', value: razorpay_payment_id },
-          { name: 'razorpay_order_id',   value: razorpay_order_id },
-          { name: 'prepaid_amount',      value: '99' },
-          { name: 'cod_amount',          value: String(balanceCOD) },
-        ],
-        send_receipt: true,
-        send_fulfillment_receipt: true,
-      },
-    };
-
-    const shopifyRes = await fetch(
-      `https://${process.env.SHOPIFY_STORE_DOMAIN}/admin/api/2024-01/orders.json`,
-      {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'X-Shopify-Access-Token': process.env.SHOPIFY_ADMIN_TOKEN,
-        },
-        body: JSON.stringify(orderPayload),
-      }
-    );
-
-    if (!shopifyRes.ok) {
-      const errText = await shopifyRes.text();
-      console.error('Shopify order creation failed:', errText);
-      return res.status(502).json({ error: 'Order creation failed', details: errText });
-    }
-
-    const { order } = await shopifyRes.json();
+    const result = await createShopifyOrder({
+      razorpay_order_id,
+      razorpay_payment_id,
+      cart,      // { total_price, items_subtotal_price, items:[{variant_id, quantity, price}] }
+      customer,  // { first_name, last_name, email, phone, address1, city, zip, province }
+    });
 
     processedPayments.add(razorpay_payment_id);
     setTimeout(() => processedPayments.delete(razorpay_payment_id), 3_600_000);
 
-    console.log('VS ORDER CREATED', {
-      order_id:    order.id,
-      order_name:  order.name,
-      customer:    `${customer.first_name} ${customer.last_name}`,
-      phone:       customer.phone,
-      city:        customer.city,
-      total:       `₹${cartTotalRupees}`,
-      advance:     '₹99',
-      balance_cod: `₹${balanceCOD}`,
-      payment_id:  razorpay_payment_id,
+    console.log('VS ORDER (browser path)', {
+      order_name: result.order.name, duplicate: result.duplicate, payment_id: razorpay_payment_id,
     });
 
     return res.status(200).json({
       success:     true,
-      order_id:    order.id,
-      order_name:  order.name,
-      balance_cod: balanceCOD,
-      total:       cartTotalRupees,
+      order_id:    result.order.id,
+      order_name:  result.order.name,
+      total:       result.order.total ?? Math.round((cart.total_price || 0) / 100),
+      balance_cod: result.order.balance_cod ?? (Math.round((cart.total_price || 0) / 100) - 99),
       payment_id:  razorpay_payment_id,
+      duplicate:   result.duplicate,
     });
-
   } catch (err) {
     console.error('verify-and-create-order exception:', err);
-    return res.status(500).json({ error: 'Internal server error', message: err.message });
+    // Even if this fails, the webhook will still create the order server-side.
+    return res.status(500).json({ error: 'Order creation failed', message: err.message });
   }
 }
